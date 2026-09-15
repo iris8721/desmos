@@ -207,12 +207,13 @@ async function videoToDesmos(inputPath, outputPath, options = {}) {
   }
 }
 
-const [,, inputPath, outputPath = 'output.mp4'] = process.argv;
-if (!inputPath) {
-  console.error('usage: node video.js <input-video> [output.mp4]');
-  process.exit(1);
+if (require.main === module) {
+  const [,, inputPath, outputPath = 'output.mp4'] = process.argv;
+  if (!inputPath) {
+    console.error('usage: node video.js <input-video> [output.mp4]');
+    process.exit(1);
+  }
+  videoToDesmos(inputPath, outputPath).catch(err => { console.error(err); process.exit(1); });
 }
-
-videoToDesmos(inputPath, outputPath).catch(err => { console.error(err); process.exit(1); });
 
 module.exports = { videoToDesmos };
