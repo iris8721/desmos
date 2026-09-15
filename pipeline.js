@@ -183,11 +183,20 @@ const CALC_OPTIONS = {
   showGrid: false, showXAxis: false, showYAxis: false,
 };
 
+function withTimeout(promise, ms, message) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 class DesmosRenderer {
-  constructor(width = 800, height = 800, range = 8) {
+  constructor(width = 800, height = 800, range = 8, timeout = 60000) {
     this.width = width;
     this.height = height;
     this.range = range;
+    this.timeout = timeout;
     this.browser = null;
     this.page = null;
   }
@@ -213,10 +222,10 @@ class DesmosRenderer {
 
   async render(expressions, outputPath) {
     const stateJson = buildState(expressions, this.range);
-    const dataUrl = await this.page.evaluate((json) => {
+    const dataUrl = await withTimeout(this.page.evaluate((json) => {
       window._calc.setState(JSON.parse(json));
       return new Promise(resolve => window._calc.asyncScreenshot({ format: 'png' }, resolve));
-    }, stateJson);
+    }, stateJson), this.timeout, 'render timeout');
     fs.writeFileSync(outputPath, Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ''), 'base64'));
   }
 
@@ -249,4 +258,4 @@ if (require.main === module) {
   main().catch(err => { console.error(err); process.exit(1); });
 }
 
-module.exports = { traceImage, imageToExpressions, DesmosRenderer, buildState, CALC_OPTIONS };
+module.exports = { traceImage, imageToExpressions, DesmosRenderer, buildState, withTimeout, CALC_OPTIONS };

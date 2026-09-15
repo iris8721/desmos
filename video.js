@@ -4,57 +4,104 @@ const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { buildState, CALC_OPTIONS } = require('./pipeline');
+const { buildState, withTimeout, CALC_OPTIONS } = require('./pipeline');
 
 class WorkerPool {
   constructor(size, workerFile) {
-    this.workers = Array.from({ length: size }, () => new Worker(workerFile));
-    this.idle = [...this.workers];
+    this.workers = new Set();
+    this.idle = [];
     this.queue = [];
+    this.tasks = new Map();
+    this.error = null;
+    for (let i = 0; i < size; i++) this._spawn(workerFile);
+  }
+
+  _spawn(workerFile) {
+    const worker = new Worker(workerFile);
+    worker.on('message', result => {
+      const task = this.tasks.get(worker);
+      if (!task) return;
+      this.tasks.delete(worker);
+      this._next(worker);
+      result.error ? task.reject(new Error(result.error)) : task.resolve(result);
+    });
+    const fail = err => {
+      if (!this.workers.delete(worker)) return;
+      this.idle = this.idle.filter(w => w !== worker);
+      const task = this.tasks.get(worker);
+      this.tasks.delete(worker);
+      if (task) task.reject(err);
+      if (this.workers.size === 0) {
+        this.error = err;
+        this.queue.splice(0).forEach(t => t.reject(err));
+      }
+    };
+    worker.on('error', fail);
+    worker.on('exit', code => fail(new Error(`worker exited with code ${code}`)));
+    this.workers.add(worker);
+    this.idle.push(worker);
   }
 
   run(data) {
     return new Promise((resolve, reject) => {
-      if (this.idle.length) {
-        this._exec(this.idle.pop(), data, resolve, reject);
-      } else {
-        this.queue.push({ data, resolve, reject });
-      }
+      if (this.error) return reject(this.error);
+      const task = { data, resolve, reject };
+      if (this.idle.length) this._exec(this.idle.pop(), task);
+      else this.queue.push(task);
     });
   }
 
-  _exec(worker, data, resolve, reject) {
-    worker.once('message', result => {
-      if (this.queue.length) {
-        const next = this.queue.shift();
-        this._exec(worker, next.data, next.resolve, next.reject);
-      } else {
-        this.idle.push(worker);
-      }
-      result.error ? reject(new Error(result.error)) : resolve(result);
-    });
-    worker.postMessage(data);
+  _exec(worker, task) {
+    this.tasks.set(worker, task);
+    worker.postMessage(task.data);
   }
 
-  terminate() { this.workers.forEach(w => w.terminate()); }
+  _next(worker) {
+    if (this.queue.length) this._exec(worker, this.queue.shift());
+    else this.idle.push(worker);
+  }
+
+  terminate() {
+    const err = new Error('worker pool terminated');
+    this.error = err;
+    const workers = [...this.workers];
+    this.workers.clear();
+    this.queue.splice(0).forEach(t => t.reject(err));
+    this.tasks.forEach(t => t.reject(err));
+    this.tasks.clear();
+    return Promise.all(workers.map(w => w.terminate()));
+  }
 }
 
 class PagePool {
   constructor(pages) {
     this.pages = [...pages];
+    this.size = pages.length;
     this.queue = [];
+    this.error = null;
   }
 
   acquire() {
+    if (this.error) return Promise.reject(this.error);
     return this.pages.length
       ? Promise.resolve(this.pages.pop())
-      : new Promise(resolve => this.queue.push(resolve));
+      : new Promise((resolve, reject) => this.queue.push({ resolve, reject }));
   }
 
   release(page) {
-    if (this.queue.length) this.queue.shift()(page);
+    if (this.queue.length) this.queue.shift().resolve(page);
     else this.pages.push(page);
   }
+
+  drop(err) {
+    if (--this.size > 0) return;
+    this.error = err;
+    this.queue.splice(0).forEach(w => w.reject(err));
+  }
+}
+
+function spawnError(name, err) {
+  return err.code === 'ENOENT' ? new Error(`${name} not found on PATH`) : err;
 }
 
 function ffmpeg(args, onProgress) {
@@ -69,6 +116,7 @@ function ffmpeg(args, onProgress) {
         if (m) onProgress(parseInt(m[1]));
       }
     });
+    proc.on('error', err => reject(spawnError('ffmpeg', err)));
     proc.on('close', code => code === 0 ? resolve() : reject(new Error(stderr.slice(-300))));
   });
 }
@@ -83,6 +131,7 @@ function getExpectedFrames(inputPath, fps) {
     ], { stdio: ['ignore', 'pipe', 'ignore'] });
     let out = '';
     proc.stdout.on('data', d => out += d);
+    proc.on('error', () => resolve(null));
     proc.on('close', () => {
       const duration = parseFloat(out.trim());
       resolve(isNaN(duration) ? null : Math.round(duration * fps));
@@ -113,17 +162,23 @@ async function createPage(browser, idx, width, height, range) {
 async function renderFrame(browser, pagePool, stateJson, outPath, width, height, range, frameTimeout, retries = 2) {
   const { page, key } = await pagePool.acquire();
   try {
-    await page.evaluate((json, k) => window[k].setState(JSON.parse(json)), stateJson, key);
-    const dataUrl = await Promise.race([
-      page.evaluate(k => new Promise(resolve => window[k].asyncScreenshot({ format: 'png' }, resolve)), key),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('frame timeout')), frameTimeout)),
-    ]);
+    const dataUrl = await withTimeout(page.evaluate((json, k) => {
+      window[k].setState(JSON.parse(json));
+      return new Promise(resolve => window[k].asyncScreenshot({ format: 'png' }, resolve));
+    }, stateJson, key), frameTimeout, 'frame timeout');
     fs.writeFileSync(outPath, Buffer.from(dataUrl.replace(/^data:image\/png;base64,/, ''), 'base64'));
     pagePool.release({ page, key });
   } catch (err) {
     const idx = parseInt(key.replace('_calc', ''));
-    await page.close().catch(() => {});
-    pagePool.release(await createPage(browser, idx, width, height, range));
+    await withTimeout(page.close(), 5000, 'page close timeout').catch(() => {});
+    let replacement;
+    try {
+      replacement = await createPage(browser, idx, width, height, range);
+    } catch (createErr) {
+      pagePool.drop(createErr);
+      throw createErr;
+    }
+    pagePool.release(replacement);
     if (retries > 0) return renderFrame(browser, pagePool, stateJson, outPath, width, height, range, frameTimeout, retries - 1);
     throw err;
   }

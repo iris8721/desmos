@@ -6,6 +6,6 @@ parentPort.on('message', async ({ framePath, options }) => {
     const expressions = await imageToExpressions(framePath, { ...options, silent: true });
     parentPort.postMessage({ expressions, error: null });
   } catch (err) {
-    parentPort.postMessage({ expressions: null, error: err.message });
+    parentPort.postMessage({ expressions: null, error: String((err && err.message) || err) });
   }
 });
