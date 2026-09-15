@@ -11,30 +11,48 @@ function pathToPoints(d, bezierSamples = 8) {
   let cursor = [0, 0];
   let startPoint = [0, 0];
 
-  const tokens = d.match(/[MLCZmlcz]|[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?/g) || [];
+  const tokens = d.match(/[A-Za-z]|[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?/g) || [];
   let i = 0;
-  const next = () => parseFloat(tokens[i++]);
+  const isCmd = t => /^[A-Za-z]$/.test(t);
+  const next = () => {
+    if (i >= tokens.length || isCmd(tokens[i])) throw new Error(`malformed path data at token ${i}: ${d.slice(0, 40)}`);
+    return parseFloat(tokens[i++]);
+  };
+  const pair = rel => {
+    const x = next(), y = next();
+    return rel ? [cursor[0] + x, cursor[1] + y] : [x, y];
+  };
 
+  let cmd = null;
   while (i < tokens.length) {
-    const cmd = tokens[i++];
+    if (isCmd(tokens[i])) {
+      cmd = tokens[i++];
+    } else if (cmd === null || cmd === 'Z' || cmd === 'z') {
+      throw new Error(`malformed path data at token ${i}: ${d.slice(0, 40)}`);
+    } else if (cmd === 'M') {
+      cmd = 'L';
+    } else if (cmd === 'm') {
+      cmd = 'l';
+    }
+    const rel = cmd === cmd.toLowerCase();
     switch (cmd.toUpperCase()) {
       case 'M': {
         if (current.length > 1) contours.push(current);
         current = [];
-        cursor = [next(), next()];
+        cursor = pair(rel);
         startPoint = [...cursor];
         current.push({ x: cursor[0], y: cursor[1] });
         break;
       }
       case 'L': {
-        cursor = [next(), next()];
+        cursor = pair(rel);
         current.push({ x: cursor[0], y: cursor[1] });
         break;
       }
       case 'C': {
-        const cp1 = [next(), next()];
-        const cp2 = [next(), next()];
-        const end = [next(), next()];
+        const cp1 = pair(rel);
+        const cp2 = pair(rel);
+        const end = pair(rel);
         for (let s = 1; s <= bezierSamples; s++) {
           const t = s / bezierSamples;
           const mt = 1 - t;
@@ -52,8 +70,11 @@ function pathToPoints(d, bezierSamples = 8) {
           contours.push(current);
           current = [];
         }
+        cursor = [...startPoint];
         break;
       }
+      default:
+        throw new Error(`unsupported path command ${cmd}`);
     }
   }
   if (current.length > 1) contours.push(current);
@@ -62,23 +83,24 @@ function pathToPoints(d, bezierSamples = 8) {
 
 function extractPaths(svg) {
   const paths = [];
-  const re = /\sd="([^"]+)"/g;
+  const re = /\sd=(["'])([^"']+)\1/g;
   let m;
-  while ((m = re.exec(svg)) !== null) paths.push(m[1]);
+  while ((m = re.exec(svg)) !== null) paths.push(m[2]);
   return paths;
 }
 
 function getViewBox(svg) {
-  const m = svg.match(/viewBox="([^"]+)"/);
-  if (!m) return { w: 500, h: 500 };
-  const [, , w, h] = m[1].split(/\s+/).map(Number);
-  return { w, h };
+  const m = svg.match(/viewBox=["']([^"']+)["']/);
+  const parts = m ? m[1].trim().split(/[\s,]+/).map(Number) : [];
+  if (parts.length !== 4 || parts.some(Number.isNaN)) return { x: 0, y: 0, w: 500, h: 500 };
+  const [x, y, w, h] = parts;
+  return { x, y, w, h };
 }
 
 function buildState(expressions, range) {
   const borderLines = [
-    { id: '__bt', latex: `y=${-range}\\{${-range}\\le x\\le ${range}\\}` },
-    { id: '__bb', latex: `y=${range}\\{${-range}\\le x\\le ${range}\\}` },
+    { id: '__bt', latex: `y=${range}\\{${-range}\\le x\\le ${range}\\}` },
+    { id: '__bb', latex: `y=${-range}\\{${-range}\\le x\\le ${range}\\}` },
     { id: '__bl', latex: `x=${-range}\\{${-range}\\le y\\le ${range}\\}` },
     { id: '__br', latex: `x=${range}\\{${-range}\\le y\\le ${range}\\}` },
   ].map(e => ({ type: 'expression', color: '#000000', ...e }));
@@ -115,14 +137,14 @@ async function traceImage(imagePath, options = {}) {
   });
 
   const pathDs = extractPaths(svg);
-  const { w, h } = getViewBox(svg);
+  const { x: minX, y: minY, w, h } = getViewBox(svg);
   const scale = (2 * desmosRange) / Math.max(w, h);
   const offsetX = -(w * scale) / 2;
   const offsetY =  (h * scale) / 2;
 
   const norm = (pt) => ({
-    x: Math.round((pt.x * scale + offsetX) * 1e3) / 1e3,
-    y: Math.round((-pt.y * scale + offsetY) * 1e3) / 1e3,
+    x: Math.round(((pt.x - minX) * scale + offsetX) * 1e3) / 1e3,
+    y: Math.round((-(pt.y - minY) * scale + offsetY) * 1e3) / 1e3,
   });
 
   let contours = [];
