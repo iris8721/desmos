@@ -38,8 +38,10 @@ releases for demo output.*
    replaced, and the frame retried (up to 2 retries).
 4. `ffmpeg` stitches the rendered PNGs into an H.264 MP4.
 
-The two pools are independent: trace workers feed a promise queue while the
-page pool bounds how many Chromium tabs render at once.
+Frames are pulled by `cores + concurrency` lanes, so both pools stay busy
+without queueing the whole video up front. A frame that still fails after its
+retries, or a worker crash, aborts the render; workers and Chromium are torn
+down either way.
 
 ## Usage
 
@@ -52,6 +54,9 @@ node pipeline.js input.png [output.png]
 # video (requires ffmpeg + ffprobe on PATH)
 node video.js input.mp4 [output.mp4]
 ```
+
+Rendering needs an internet connection: every page loads `calculator.js` from
+desmos.com.
 
 `index.html` is a minimal standalone smoke test for the calculator API — open
 it in a browser and it draws `y = 2x + 1`.
@@ -70,8 +75,9 @@ it in a browser and it draws `y = 2x + 1`.
 - The API key in `index.html`, `pipeline.js`, and `video.js`
   (`dcb31709b452b1cf9dc26972add0fda6`) is Desmos's **public demo key** — the
   one they publish for examples — not a private credential.
-- Only `M`/`L`/`C`/`Z` SVG commands are handled; that covers everything
-  potrace emits.
+- Only `M`/`L`/`C`/`Z` path commands (absolute or relative, with implicit
+  repeats) are parsed; anything else throws. That covers everything potrace
+  emits.
 - Tracing is binary (threshold on grayscale), so color and shading are lost.
 - High-contour frames produce very large calculator states; `maxContours` and
   `rdpTolerance` are the knobs to turn when renders get slow.
