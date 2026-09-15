@@ -220,33 +220,46 @@ async function videoToDesmos(inputPath, outputPath, options = {}) {
 
     console.log(`launching ${concurrency} renderer(s), ${numWorkers} trace workers...`);
 
-    const workerPool = new WorkerPool(numWorkers, path.join(__dirname, 'worker.js'));
     const browser = await puppeteer.launch({ protocolTimeout: 0 });
-    const pagePool = new PagePool(
-      await Promise.all(Array.from({ length: concurrency }, (_, i) => createPage(browser, i, width, height, desmosRange)))
-    );
+    const workerPool = new WorkerPool(numWorkers, path.join(__dirname, 'worker.js'));
+    try {
+      const pagePool = new PagePool(
+        await Promise.all(Array.from({ length: concurrency }, (_, i) => createPage(browser, i, width, height, desmosRange)))
+      );
 
-    let done = 0;
-    const start = Date.now();
-    const print = () => {
-      const rate = done / ((Date.now() - start) / 1000);
-      const eta = Math.round((total - done) / rate);
-      process.stdout.write(`\r  [${String(done).padStart(String(total).length)}/${total}]  ${rate.toFixed(1)} fr/s  eta ${eta}s`);
-    };
+      let done = 0;
+      const start = Date.now();
+      const print = () => {
+        const rate = done / ((Date.now() - start) / 1000);
+        const eta = Math.round((total - done) / rate);
+        process.stdout.write(`\r  [${String(done).padStart(String(total).length)}/${total}]  ${rate.toFixed(1)} fr/s  eta ${eta}s`);
+      };
 
-    console.log('processing frames...');
-    await Promise.all(framePaths.map(async (framePath, i) => {
-      const outPath = path.join(framesOutDir, `frame_${String(i).padStart(6, '0')}.png`);
-      const { expressions } = await workerPool.run({ framePath, options: { ...traceOptions, desmosRange, silent: true } });
-      const stateJson = buildState(expressions, desmosRange);
-      await renderFrame(browser, pagePool, stateJson, outPath, width, height, desmosRange, frameTimeout);
-      done++;
-      print();
-    }));
-
-    console.log();
-    workerPool.terminate();
-    await browser.close();
+      console.log('processing frames...');
+      let nextFrame = 0;
+      let failure = null;
+      const lane = async () => {
+        while (nextFrame < total && !failure) {
+          const i = nextFrame++;
+          try {
+            const outPath = path.join(framesOutDir, `frame_${String(i).padStart(6, '0')}.png`);
+            const { expressions } = await workerPool.run({ framePath: framePaths[i], options: { ...traceOptions, desmosRange, silent: true } });
+            const stateJson = buildState(expressions, desmosRange);
+            await renderFrame(browser, pagePool, stateJson, outPath, width, height, desmosRange, frameTimeout);
+            done++;
+            print();
+          } catch (err) {
+            failure ??= err;
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: numWorkers + concurrency }, lane));
+      if (failure) throw failure;
+      console.log();
+    } finally {
+      await workerPool.terminate().catch(() => {});
+      await browser.close().catch(() => {});
+    }
 
     await ffmpeg([
       '-framerate', String(fps),
